@@ -1,0 +1,617 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <title>手势绘画 - 指尖魔法</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+            user-select: none;
+            -webkit-tap-highlight-color: transparent;
+        }
+        body {
+            background: #0a0a2a;
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            font-family: 'Segoe UI', system-ui, -apple-system, 'Roboto', sans-serif;
+            overflow: hidden;
+            touch-action: none; /* 避免触摸滚动干扰画板，但手势交互不依赖触摸 */
+        }
+        .container {
+            position: relative;
+            width: 100vw;
+            height: 100vh;
+            background: #000;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            overflow: hidden;
+        }
+        canvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
+            background: #000;
+        }
+        #videoCanvas {
+            z-index: 1;
+            background: #000;
+        }
+        #drawCanvas {
+            z-index: 2;
+            background: transparent;
+            pointer-events: none; /* 让画布不干扰摄像头手势识别区域 */
+        }
+        .info {
+            position: absolute;
+            bottom: 16px;
+            left: 0;
+            right: 0;
+            text-align: center;
+            z-index: 10;
+            color: rgba(255,255,255,0.7);
+            background: rgba(0,0,0,0.5);
+            backdrop-filter: blur(8px);
+            padding: 8px 12px;
+            border-radius: 40px;
+            width: fit-content;
+            margin: 0 auto;
+            font-size: 12px;
+            font-weight: 500;
+            pointer-events: none;
+            font-family: monospace;
+        }
+        .status {
+            position: absolute;
+            top: 16px;
+            right: 16px;
+            z-index: 10;
+            background: rgba(0,0,0,0.6);
+            backdrop-filter: blur(4px);
+            padding: 6px 12px;
+            border-radius: 30px;
+            color: #0f0;
+            font-size: 12px;
+            font-family: monospace;
+            pointer-events: none;
+        }
+        @media (max-width: 600px) {
+            .info { font-size: 10px; bottom: 8px; }
+            .status { font-size: 10px; top: 8px; right: 8px; }
+        }
+        button.clear-btn {
+            position: absolute;
+            bottom: 20px;
+            right: 20px;
+            z-index: 20;
+            background: #ff4757;
+            border: none;
+            color: white;
+            padding: 8px 16px;
+            border-radius: 40px;
+            font-weight: bold;
+            cursor: pointer;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.3);
+            font-size: 14px;
+            pointer-events: auto;
+            font-family: inherit;
+        }
+        button.clear-btn:active {
+            transform: scale(0.96);
+        }
+    </style>
+</head>
+<body>
+<div class="container">
+    <canvas id="videoCanvas" width="640" height="480"></canvas>
+    <canvas id="drawCanvas" width="640" height="480"></canvas>
+    <div class="status" id="statusLabel">🤚 等待手势...</div>
+    <div class="info">✋ 拇指+食指捏合 → 绘画 &nbsp;&nbsp;|&nbsp;&nbsp;✌️ 胜利手势(食指中指竖立) → 清空画布 &nbsp;&nbsp;|&nbsp;&nbsp;🖐️ 双手 → 显示视频窗口</div>
+    <button class="clear-btn" id="manualClearBtn">🗑️ 清屏</button>
+</div>
+
+<!-- 引入 Mediapipe 核心库 -->
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+
+<script>
+    (function(){
+        // ----- 配置参数 (与 Python 原版对齐) -----
+        const PINCH_THRESH = 38;          // 捏合距离阈值 (像素)
+        const BRUSH_THICKNESS = 6;
+        const CLEAR_COOLDOWN_MS = 500;     // 胜利手势清屏冷却(ms)
+        const CIRCLE_CLOSE_DIST = 50;      // 起点终点闭合距离阈值(像素)
+        const CIRCLE_RADIUS_STD_RATIO = 0.3; // 圆形检测标准差/均值比率
+        const MIN_POINTS_FOR_CIRCLE = 10;   // 最少点数才能检测圆
+
+        // DOM 元素
+        const videoCanvas = document.getElementById('videoCanvas');
+        const drawCanvas = document.getElementById('drawCanvas');
+        const ctxVideo = videoCanvas.getContext('2d');
+        const ctxDraw = drawCanvas.getContext('2d');
+        const statusSpan = document.getElementById('statusLabel');
+
+        // 绘图状态
+        let drawImageData = null;            // 持久绘图层内容 (离屏保存)
+        let lastPoint = null;               // 上一笔画的坐标
+        let drawingActive = false;          // 当前是否正在绘画中(捏合)
+        let currentStrokePoints = [];       // 当前笔画的所有点 (用于圆检测)
+        let hue = 0;                        // 色相 (动态彩虹笔)
+        let rayEffects = [];                // 光线特效数组
+        
+        let lastClearTime = 0;              // 上次清屏时间戳(ms)
+        
+        // 视频/手势相关
+        let videoElement = null;             // 动态video元素
+        let handsInstance = null;
+        let cameraInstance = null;
+        let animationFrameId = null;
+        
+        // 画布尺寸 (固定为640x480，与视频流一致)
+        const CANVAS_W = 640;
+        const CANVAS_H = 480;
+        videoCanvas.width = CANVAS_W;
+        videoCanvas.height = CANVAS_H;
+        drawCanvas.width = CANVAS_W;
+        drawCanvas.height = CANVAS_H;
+        
+        // 初始化绘图层背景(透明)
+        ctxDraw.clearRect(0, 0, CANVAS_W, CANVAS_H);
+        // 保存初始空白图像数据
+        function saveDrawLayer() {
+            drawImageData = ctxDraw.getImageData(0, 0, CANVAS_W, CANVAS_H);
+        }
+        function restoreDrawLayer() {
+            if (drawImageData) {
+                ctxDraw.putImageData(drawImageData, 0, 0);
+            }
+        }
+        saveDrawLayer(); // 初始空白
+        
+        // 清空画布 (持久层)
+        function clearCanvas() {
+            ctxDraw.clearRect(0, 0, CANVAS_W, CANVAS_H);
+            saveDrawLayer();
+            // 重置笔画记录
+            currentStrokePoints = [];
+            lastPoint = null;
+            drawingActive = false;
+            rayEffects = [];
+            console.log("画布已清空");
+            statusSpan.innerText = "✨ 画布已清空";
+            setTimeout(() => {
+                if (statusSpan.innerText === "✨ 画布已清空") statusSpan.innerText = "🎨 绘画模式";
+            }, 1000);
+        }
+        
+        // 手动清空按钮
+        document.getElementById('manualClearBtn').addEventListener('click', () => {
+            clearCanvas();
+        });
+        
+        // ========== 辅助函数 ==========
+        function clamp(val, min, max) {
+            return Math.min(max, Math.max(min, val));
+        }
+        
+        // 获取两点距离
+        function distance(p1, p2) {
+            const dx = p1.x - p2.x;
+            const dy = p1.y - p2.y;
+            return Math.hypot(dx, dy);
+        }
+        
+        // 胜利手势检测 (食指中指伸直，无名指小指弯曲)
+        function isVictoryGesture(landmarks) {
+            // landmarks 是 Mediapipe 21个点数组，每个点有x,y,z (归一化0-1)
+            const indexTip = landmarks[8];
+            const indexBase = landmarks[6];
+            const middleTip = landmarks[12];
+            const middleBase = landmarks[10];
+            const ringTip = landmarks[16];
+            const ringBase = landmarks[14];
+            const pinkyTip = landmarks[20];
+            const pinkyBase = landmarks[18];
+            
+            const indexUp = indexTip.y < indexBase.y;
+            const middleUp = middleTip.y < middleBase.y;
+            const ringDown = ringTip.y > ringBase.y;
+            const pinkyDown = pinkyTip.y > pinkyBase.y;
+            return indexUp && middleUp && ringDown && pinkyDown;
+        }
+        
+        // 检测闭合圆 (基于当前笔画点集)
+        function isClosedCircle(points, w, h) {
+            if (points.length < MIN_POINTS_FOR_CIRCLE) return false;
+            const start = points[0];
+            const end = points[points.length-1];
+            const distStartEnd = Math.hypot(start.x - end.x, start.y - end.y);
+            if (distStartEnd > CIRCLE_CLOSE_DIST) return false;
+            
+            // 计算中心点
+            let sumX = 0, sumY = 0;
+            for (let p of points) {
+                sumX += p.x;
+                sumY += p.y;
+            }
+            const cx = sumX / points.length;
+            const cy = sumY / points.length;
+            const radii = [];
+            for (let p of points) {
+                radii.push(Math.hypot(p.x - cx, p.y - cy));
+            }
+            const meanR = radii.reduce((a,b)=>a+b,0)/radii.length;
+            if (meanR < 20) return false;  // 半径太小，忽略
+            const variance = radii.map(r => (r-meanR)**2).reduce((a,b)=>a+b,0)/radii.length;
+            const stdDev = Math.sqrt(variance);
+            if (stdDev / meanR < CIRCLE_RADIUS_STD_RATIO) {
+                return true;
+            }
+            return false;
+        }
+        
+        // 计算封闭圆的圆心和半径 (复用点集)
+        function getCircleParams(points) {
+            let sumX = 0, sumY = 0;
+            for (let p of points) {
+                sumX += p.x;
+                sumY += p.y;
+            }
+            const cx = sumX / points.length;
+            const cy = sumY / points.length;
+            let sumR = 0;
+            for (let p of points) {
+                sumR += Math.hypot(p.x - cx, p.y - cy);
+            }
+            const radius = sumR / points.length;
+            return { center: { x: cx, y: cy }, radius: radius };
+        }
+        
+        // 绘制金色静态圆环 (持久)
+        function drawGoldenRingStatic(ctx, center, radius) {
+            ctx.save();
+            ctx.beginPath();
+            ctx.arc(center.x, center.y, radius, 0, Math.PI * 2);
+            ctx.strokeStyle = "#FFD700";
+            ctx.lineWidth = 5;
+            ctx.stroke();
+            // 内圈细环
+            ctx.beginPath();
+            ctx.arc(center.x, center.y, radius - 4, 0, Math.PI * 2);
+            ctx.strokeStyle = "#FFC107";
+            ctx.lineWidth = 2.5;
+            ctx.stroke();
+            ctx.restore();
+        }
+        
+        // ========== 光线特效 (仿照Python版，动态虚线放射) ==========
+        function createRayEffect(center, baseRadius, numRays = 16) {
+            const rays = [];
+            const step = (Math.PI * 2) / numRays;
+            const angles = [];
+            for (let i = 0; i < numRays; i++) angles.push(i * step);
+            // 随机打乱顺序让光线随机感
+            for (let i = angles.length - 1; i > 0; i--) {
+                const j = Math.floor(Math.random() * (i + 1));
+                [angles[i], angles[j]] = [angles[j], angles[i]];
+            }
+            for (let angle of angles) {
+                const maxLen = baseRadius * (1.8 + Math.random() * 1.5); // 1.8~3.3倍半径
+                const dashLen = Math.floor(5 + Math.random() * 10);  // 5~14
+                const gapLen = Math.floor(3 + Math.random() * 8);    // 3~10
+                rays.push({ angle, maxLen, dash: dashLen, gap: gapLen });
+            }
+            return {
+                center: { x: center.x, y: center.y },
+                baseRadius: baseRadius,
+                rays: rays,
+                startTime: performance.now(),
+                animDuration: 1500,   // 1.5秒伸展动画
+                holdDuration: 1800    // 保持1.8秒后消失
+            };
+        }
+        
+        // 绘制虚线 (从起点到终点，交替实线/空隙)
+        function drawDashedLine(ctx, from, to, color, thickness, dashLen, gapLen) {
+            const dx = to.x - from.x;
+            const dy = to.y - from.y;
+            const len = Math.hypot(dx, dy);
+            if (len < 0.1) return;
+            const dirX = dx / len;
+            const dirY = dy / len;
+            let dist = 0;
+            let draw = true;
+            ctx.save();
+            ctx.beginPath();
+            ctx.strokeStyle = color;
+            ctx.lineWidth = thickness;
+            ctx.lineCap = "round";
+            while (dist < len) {
+                const startDist = dist;
+                const segLen = draw ? dashLen : gapLen;
+                let endDist = Math.min(dist + segLen, len);
+                if (draw) {
+                    const p1 = { x: from.x + dirX * startDist, y: from.y + dirY * startDist };
+                    const p2 = { x: from.x + dirX * endDist, y: from.y + dirY * endDist };
+                    ctx.beginPath();
+                    ctx.moveTo(p1.x, p1.y);
+                    ctx.lineTo(p2.x, p2.y);
+                    ctx.stroke();
+                }
+                dist = endDist;
+                draw = !draw;
+            }
+            ctx.restore();
+        }
+        
+        // 绘制单个射线特效 (返回是否仍然存活)
+        function drawRayEffect(ctx, effect, now) {
+            const elapsed = now - effect.startTime;
+            const total = effect.animDuration + effect.holdDuration;
+            if (elapsed >= total) return false;
+            
+            let factor = 0;
+            if (elapsed <= effect.animDuration) {
+                factor = elapsed / effect.animDuration;  // 线性增长
+            } else {
+                factor = 1.0;  // 保持最远
+            }
+            const center = effect.center;
+            const baseR = effect.baseRadius;
+            for (let ray of effect.rays) {
+                const currLen = baseR + factor * (ray.maxLen - baseR);
+                const endX = center.x + Math.cos(ray.angle) * currLen;
+                const endY = center.y + Math.sin(ray.angle) * currLen;
+                const startX = center.x + Math.cos(ray.angle) * baseR;
+                const startY = center.y + Math.sin(ray.angle) * baseR;
+                drawDashedLine(ctx, {x: startX, y: startY}, {x: endX, y: endY}, "#FFD700", 2.2, ray.dash, ray.gap);
+            }
+            return true;
+        }
+        
+        // 更新并绘制所有光线特效 (在videoCanvas上临时绘制，不影响持久画布)
+        function updateAndDrawRayEffects(ctx, now) {
+            const newEffects = [];
+            for (let effect of rayEffects) {
+                if (drawRayEffect(ctx, effect, now)) {
+                    newEffects.push(effect);
+                }
+            }
+            rayEffects = newEffects;
+        }
+        
+        // 结束笔画: 检测圆并绘制金色光环&添加特效
+        function finishStroke() {
+            if (currentStrokePoints.length >= MIN_POINTS_FOR_CIRCLE) {
+                const isCircle = isClosedCircle(currentStrokePoints, CANVAS_W, CANVAS_H);
+                if (isCircle) {
+                    const { center, radius } = getCircleParams(currentStrokePoints);
+                    // 在持久绘图层上绘制金色圆环
+                    drawGoldenRingStatic(ctxDraw, center, radius);
+                    saveDrawLayer();   // 保存到持久层
+                    // 添加动态光线特效 (仅临时显示)
+                    rayEffects.push(createRayEffect(center, radius, 20));
+                    statusSpan.innerText = "🌟 金色圆环!";
+                    setTimeout(() => {
+                        if (statusSpan.innerText === "🌟 金色圆环!") statusSpan.innerText = "🎨 绘画模式";
+                    }, 800);
+                }
+            }
+            currentStrokePoints = [];
+        }
+        
+        // ========== Mediapipe 手势处理核心 ==========
+        async function onHandResults(results) {
+            // 1. 绘制原始视频帧到 videoCanvas 背景
+            if (videoElement && videoElement.videoWidth) {
+                ctxVideo.drawImage(videoElement, 0, 0, CANVAS_W, CANVAS_H);
+            } else {
+                ctxVideo.fillStyle = "#000";
+                ctxVideo.fillRect(0, 0, CANVAS_W, CANVAS_H);
+            }
+            
+            // 恢复持久绘图层到 drawCanvas (后续会在其上绘制新笔触)
+            restoreDrawLayer();
+            
+            const hands = results.multiHandLandmarks;
+            let handCount = hands ? hands.length : 0;
+            
+            // 状态提示
+            if (handCount === 0) {
+                statusSpan.innerText = "🤚 未检测到手";
+                // 结束任何正在绘制的笔画
+                if (drawingActive) {
+                    finishStroke();
+                    drawingActive = false;
+                    lastPoint = null;
+                }
+            } else {
+                statusSpan.innerText = `✋ 检测到 ${handCount} 只手`;
+            }
+            
+            // 储存每个手的像素坐标 (用于双手矩形)
+            const handBoxes = [];
+            
+            // 如果检测到手，遍历处理绘画与矩形
+            if (hands && hands.length > 0) {
+                for (let idx = 0; idx < hands.length; idx++) {
+                    const landmarks = hands[idx];
+                    // 归一化坐标转像素 (基于当前画布尺寸)
+                    const lmPixels = landmarks.map(lm => ({
+                        x: lm.x * CANVAS_W,
+                        y: lm.y * CANVAS_H,
+                        z: lm.z
+                    }));
+                    
+                    // 胜利手势清屏 (只要任意一只手胜利就执行，带冷却)
+                    if (isVictoryGesture(lmPixels)) {
+                        const nowTime = Date.now();
+                        if (nowTime - lastClearTime > CLEAR_COOLDOWN_MS) {
+                            clearCanvas();
+                            lastClearTime = nowTime;
+                        }
+                        // 如果胜利手势，强制结束当前笔画避免残留
+                        if (drawingActive) {
+                            finishStroke();
+                            drawingActive = false;
+                            lastPoint = null;
+                        }
+                        // 仍然需要继续收集矩形坐标，不退出
+                    }
+                    
+                    // 收集拇指(4)和食指(8)坐标用于捏合绘画，也用于矩形边界计算 (矩形需要所有指尖)
+                    const thumb = lmPixels[4];
+                    const index = lmPixels[8];
+                    if (!thumb || !index) continue;
+                    
+                    // 记录手的边界框 (拇指和食指以及中指无名指小指尖) 用于双手矩形区域
+                    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+                    for (let i = 0; i < lmPixels.length; i++) {
+                        minX = Math.min(minX, lmPixels[i].x);
+                        minY = Math.min(minY, lmPixels[i].y);
+                        maxX = Math.max(maxX, lmPixels[i].x);
+                        maxY = Math.max(maxY, lmPixels[i].y);
+                    }
+                    handBoxes.push({ minX, minY, maxX, maxY });
+                    
+                    // 单手捏合绘画逻辑 (只有当手数量为1时执行绘画，双手模式不绘画，只展示矩形区域)
+                    if (hands.length === 1) {
+                        const pinchDist = distance(thumb, index);
+                        const currentPoint = { x: index.x, y: index.y };
+                        
+                        if (pinchDist < PINCH_THRESH) {
+                            // 绘画中更新颜色(动态色相)
+                            hue = (hue + 2) % 360;
+                            const brushColor = `hsl(${hue}, 100%, 60%)`;
+                            if (lastPoint) {
+                                ctxDraw.beginPath();
+                                ctxDraw.moveTo(lastPoint.x, lastPoint.y);
+                                ctxDraw.lineTo(currentPoint.x, currentPoint.y);
+                                ctxDraw.strokeStyle = brushColor;
+                                ctxDraw.lineWidth = BRUSH_THICKNESS;
+                                ctxDraw.lineCap = "round";
+                                ctxDraw.stroke();
+                                // 记录当前笔画的点用于圆形检测
+                                if (currentStrokePoints.length === 0 || distance(currentStrokePoints[currentStrokePoints.length-1], currentPoint) > 3) {
+                                    currentStrokePoints.push({ x: currentPoint.x, y: currentPoint.y });
+                                }
+                                saveDrawLayer(); // 实时保存绘图
+                            }
+                            lastPoint = currentPoint;
+                            drawingActive = true;
+                        } else {
+                            // 未捏合: 结束笔画
+                            if (drawingActive) {
+                                finishStroke();
+                                drawingActive = false;
+                            }
+                            lastPoint = null;
+                        }
+                    }
+                }
+                
+                // 双手模式: 绘制矩形区域并显示内部的原始视频内容
+                if (hands.length === 2 && handBoxes.length === 2) {
+                    // 合并两只手的边界框
+                    let globalMinX = Math.min(handBoxes[0].minX, handBoxes[1].minX);
+                    let globalMinY = Math.min(handBoxes[0].minY, handBoxes[1].minY);
+                    let globalMaxX = Math.max(handBoxes[0].maxX, handBoxes[1].maxX);
+                    let globalMaxY = Math.max(handBoxes[0].maxY, handBoxes[1].maxY);
+                    globalMinX = clamp(globalMinX, 0, CANVAS_W);
+                    globalMinY = clamp(globalMinY, 0, CANVAS_H);
+                    globalMaxX = clamp(globalMaxX, 0, CANVAS_W);
+                    globalMaxY = clamp(globalMaxY, 0, CANVAS_H);
+                    if (globalMaxX > globalMinX && globalMaxY > globalMinY) {
+                        // 绘制矩形线框
+                        ctxVideo.save();
+                        ctxVideo.strokeStyle = "#C8967F";
+                        ctxVideo.lineWidth = 6;
+                        ctxVideo.strokeRect(globalMinX, globalMinY, globalMaxX - globalMinX, globalMaxY - globalMinY);
+                        // 提取矩形区域原始视频 (直接从 videoCanvas 当前内容中获取像素区域并覆盖回去? 但原始帧已绘制)
+                        // 更优雅: 利用canvas的getImageData把该区域从 videoCanvas 取出然后 draw 回同样位置，突出显示区域
+                        try {
+                            const imageData = ctxVideo.getImageData(globalMinX, globalMinY, globalMaxX - globalMinX, globalMaxY - globalMinY);
+                            ctxVideo.putImageData(imageData, globalMinX, globalMinY);
+                        } catch(e){}
+                        ctxVideo.restore();
+                    }
+                }
+            } else {
+                // 无手，确保绘画结束
+                if (drawingActive) {
+                    finishStroke();
+                    drawingActive = false;
+                    lastPoint = null;
+                }
+            }
+            
+            // 将绘图层(drawCanvas) 合成到 videoCanvas 上层（最终显示）
+            ctxVideo.drawImage(drawCanvas, 0, 0);
+            
+            // 绘制动态光线特效（临时特效，不会保存在持久层）
+            const nowPerf = performance.now();
+            updateAndDrawRayEffects(ctxVideo, nowPerf);
+            
+            // 额外: 绘画时若双手模式则不绘画，但矩形显示已经做了，同时需要取消之前的绘制残留lastPoint逻辑
+            // 若双手模式强制重置 lastPoint 避免退出双手后错误连线
+            if (hands && hands.length === 2) {
+                if (drawingActive) {
+                    finishStroke();
+                    drawingActive = false;
+                }
+                lastPoint = null;
+            }
+        }
+        
+        // 初始化摄像头与Mediapipe Hands
+        async function init() {
+            // 创建video元素
+            videoElement = document.createElement('video');
+            videoElement.setAttribute('autoplay', '');
+            videoElement.setAttribute('playsinline', '');
+            videoElement.style.display = 'none';
+            document.body.appendChild(videoElement);
+            
+            handsInstance = new Hands({
+                locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+            });
+            handsInstance.setOptions({
+                maxNumHands: 2,
+                modelComplexity: 1,
+                minDetectionConfidence: 0.7,
+                minTrackingConfidence: 0.5
+            });
+            handsInstance.onResults(onHandResults);
+            
+            cameraInstance = new Camera(videoElement, {
+                onFrame: async () => {
+                    if (handsInstance && videoElement && videoElement.videoWidth) {
+                        await handsInstance.send({ image: videoElement });
+                    }
+                },
+                width: CANVAS_W,
+                height: CANVAS_H
+            });
+            await cameraInstance.start();
+            
+            // 初始化一次画布保存
+            saveDrawLayer();
+        }
+        
+        // 启动
+        init().catch(err => {
+            console.error("启动失败: ", err);
+            statusSpan.innerText = "❌ 摄像头不可用，请检查权限";
+        });
+    })();
+</script>
+</body>
+</html>
